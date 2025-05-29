@@ -43,6 +43,9 @@ var (
 	ByzantiumBlockReward      = big.NewInt(1e+18) // Block reward in wei for successfully mining a block upward from Byzantium (1 ETH)
 	ConstantinopleBlockReward = big.NewInt(1e+18) // Block reward in wei for successfully mining a block upward from Constantinople (1 ETH)
 
+	// Hard Forks
+	RewardUpdateForkBlock = 21000
+
 	// Reward distribution percentages
 	MinerRewardPercentage     = 15 // Percentage of block reward for miner (15%)
 	StakingRewardPercentage   = 50 // Percentage of block reward for staking (50%)
@@ -685,6 +688,14 @@ var (
 // - Development: 5% (sent to the development reward address)
 // The total reward decreases by 12.5% every year (approximately every 2,102,400 blocks).
 func accumulateRewards(config *params.ChainConfig, state *state.StateDB, header *types.Header, uncles []*types.Header) {
+	if header.Number.Cmp(big.NewInt(int64(RewardUpdateForkBlock))) >= 0 {
+		accumulateRewardsV2(config, state, header, uncles)
+	} else {
+		accumulateRewardsV1(config, state, header, uncles)
+	}
+}
+
+func accumulateRewardsV1(config *params.ChainConfig, state *state.StateDB, header *types.Header, uncles []*types.Header) {
 	// Select the correct block reward based on chain progression
 	baseBlockReward := FrontierBlockReward
 	if config.IsByzantium(header.Number) {
@@ -755,10 +766,92 @@ func accumulateRewards(config *params.ChainConfig, state *state.StateDB, header 
 	//fmt.Println("Liquidity reward:", liquidityReward.String())
 	//fmt.Println("Grant reward:", grantReward.String())
 	//fmt.Println("Dev reward:", devReward.String())
-	//fmt.Println("=================================================")
+	//fmt.Println("OLD =================================================")
 
 	// Distribute the rewards
 	state.AddBalance(header.Coinbase, minerReward)            // Miner's reward
+	state.AddBalance(StakingRewardAddress, stakingReward)     // Staking reward
+	state.AddBalance(LiquidityRewardAddress, liquidityReward) // Liquidity reward
+	state.AddBalance(DevRewardAddress, devReward)             // Development reward
+	state.AddBalance(GrantRewardAddress, grantReward)         // Grant reward
+}
+
+func accumulateRewardsV2(config *params.ChainConfig, state *state.StateDB, header *types.Header, uncles []*types.Header) {
+	// Select the correct block reward based on chain progression
+	baseBlockReward := FrontierBlockReward
+	if config.IsByzantium(header.Number) {
+		baseBlockReward = ByzantiumBlockReward
+	}
+	if config.IsConstantinople(header.Number) {
+		baseBlockReward = ConstantinopleBlockReward
+	}
+
+	// Calculate the reward reduction based on block number
+	// Reduction factor = (1 - 0.125)^years = (1 - 0.125)^(blockNumber / blocksPerYear)
+	years := new(big.Int).Div(header.Number, new(big.Int).SetUint64(BlocksPerYear))
+	reductionFactor := new(big.Int).SetInt64(1000) // Start with 100.0% (scaled by 10)
+
+	// Apply reduction: reductionFactor = reductionFactor * (1 - AnnualReductionPercentage/1000)^years
+	for i := new(big.Int).Set(years); i.Sign() > 0; i.Sub(i, big1) {
+		// Multiply by (1000 - AnnualRewardReductionPercentage) / 1000
+		reductionFactor.Mul(reductionFactor, big.NewInt(1000-int64(AnnualRewardReductionPercentage)))
+		reductionFactor.Div(reductionFactor, big.NewInt(1000))
+	}
+
+	// Apply the reduction factor to the base block reward
+	blockReward := new(big.Int).Set(baseBlockReward)
+	blockReward.Mul(blockReward, reductionFactor)
+	blockReward.Div(blockReward, big.NewInt(1000))
+
+	// Calculate rewards for each recipient
+	minerReward := new(big.Int).Set(blockReward)
+	minerReward.Mul(minerReward, big.NewInt(int64(MinerRewardPercentage)))
+	minerReward.Div(minerReward, big.NewInt(100))
+
+	stakingReward := new(big.Int).Set(blockReward)
+	stakingReward.Mul(stakingReward, big.NewInt(int64(StakingRewardPercentage)))
+	stakingReward.Div(stakingReward, big.NewInt(100))
+
+	liquidityReward := new(big.Int).Set(blockReward)
+	liquidityReward.Mul(liquidityReward, big.NewInt(int64(LiquidityRewardPercentage)))
+	liquidityReward.Div(liquidityReward, big.NewInt(100))
+
+	grantReward := new(big.Int).Set(blockReward)
+	grantReward.Mul(grantReward, big.NewInt(int64(GrantRewardPercentage)))
+	grantReward.Div(grantReward, big.NewInt(100))
+
+	devReward := new(big.Int).Set(blockReward)
+	devReward.Mul(devReward, big.NewInt(int64(DevRewardPercentage)))
+	devReward.Div(devReward, big.NewInt(100))
+
+	totalMinerReward := new(big.Int).Set(minerReward)
+
+	// Uncle rewards come from miner's portion
+	uncleReward := new(big.Int)
+	for _, uncle := range uncles {
+		// Uncle gets (8-delta)/8 of MINER'S portion, not full block reward
+		uncleReward.Add(uncle.Number, big8)
+		uncleReward.Sub(uncleReward, header.Number)
+		uncleReward.Mul(uncleReward, minerReward)
+		uncleReward.Div(uncleReward, big8)
+		state.AddBalance(uncle.Coinbase, uncleReward)
+		//fmt.Println("Uncle reward:", uncleReward.String())
+
+		// Block miner gets 1/32 of MINER'S portion for including uncle
+		inclusionReward := new(big.Int).Div(minerReward, big32)
+		totalMinerReward.Add(totalMinerReward, inclusionReward)
+	}
+
+	//fmt.Println("Block reward:", blockReward.String())
+	//fmt.Println("Miner reward:", minerReward.String())
+	//fmt.Println("Staking reward:", stakingReward.String())
+	//fmt.Println("Liquidity reward:", liquidityReward.String())
+	//fmt.Println("Grant reward:", grantReward.String())
+	//fmt.Println("Dev reward:", devReward.String())
+	//fmt.Println("NEW =================================================")
+
+	// Distribute the rewards
+	state.AddBalance(header.Coinbase, totalMinerReward)       // Miner's reward
 	state.AddBalance(StakingRewardAddress, stakingReward)     // Staking reward
 	state.AddBalance(LiquidityRewardAddress, liquidityReward) // Liquidity reward
 	state.AddBalance(DevRewardAddress, devReward)             // Development reward
